@@ -1,23 +1,23 @@
 #[cfg(test)]
-mod test {
+mod testsuit {
     use crate::*;
-    use soroban_sdk::Env;
     use soroban_sdk::testutils::{Ledger, LedgerInfo};
+    use soroban_sdk::Env;
 
     fn set_time(env: &Env, timestamp: u64) {
-    let proto = env.ledger().protocol_version();
+        let proto = env.ledger().protocol_version();
 
-    env.ledger().set(LedgerInfo {
-        protocol_version: proto,
-        sequence_number: 1,
-        timestamp,
-        network_id: [0; 32],
-        base_reserve: 10,
-        min_temp_entry_ttl: 1,
-        min_persistent_entry_ttl: 1,
-        max_entry_ttl: 100000,
-    });
-}
+        env.ledger().set(LedgerInfo {
+            protocol_version: proto,
+            sequence_number: 1,
+            timestamp,
+            network_id: [0; 32],
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 100000,
+        });
+    }
 
     #[test]
     fn test_create_bill() {
@@ -39,7 +39,7 @@ mod test {
         assert!(bill.is_some());
         let bill = bill.unwrap();
         assert_eq!(bill.amount, 1000);
-        assert_eq!(bill.paid, false);
+        assert!(!bill.paid);
     }
 
     #[test]
@@ -100,7 +100,8 @@ mod test {
         client.pay_bill(&bill_id);
 
         let bill = client.get_bill(&bill_id).unwrap();
-        assert_eq!(bill.paid, true);
+        assert!(bill.paid);
+
         assert!(bill.paid_at.is_some());
     }
 
@@ -122,11 +123,12 @@ mod test {
 
         // Check original bill is paid
         let bill = client.get_bill(&bill_id).unwrap();
-        assert_eq!(bill.paid, true);
+        assert!(bill.paid);
 
         // Check next recurring bill was created
         let bill2 = client.get_bill(&2).unwrap();
-        assert_eq!(bill2.paid, false);
+        assert!(!bill2.paid);
+
         assert_eq!(bill2.amount, 10000);
         assert_eq!(bill2.due_date, 1000000 + (30 * 86400));
     }
@@ -264,13 +266,13 @@ mod test {
         // Pay first bill - creates second
         client.pay_bill(&bill_id);
         let bill2 = client.get_bill(&2).unwrap();
-        assert_eq!(bill2.paid, false);
+        assert!(!bill2.paid);
         assert_eq!(bill2.due_date, 1000000 + (30 * 86400));
 
         // Pay second bill - creates third
         client.pay_bill(&2);
         let bill3 = client.get_bill(&3).unwrap();
-        assert_eq!(bill3.paid, false);
+        assert!(!bill3.paid);
         assert_eq!(bill3.due_date, 1000000 + (60 * 86400));
     }
 
