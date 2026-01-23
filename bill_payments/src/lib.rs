@@ -43,14 +43,6 @@ pub enum BillEvent {
     Paid,
 }
 
-/// Events emitted by the contract for audit trail
-#[contracttype]
-#[derive(Clone)]
-pub enum BillEvent {
-    Created,
-    Paid,
-}
-
 #[contract]
 pub struct BillPayments;
 
