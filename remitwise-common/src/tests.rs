@@ -2239,24 +2239,102 @@ fn test_same_address_symmetric() {
 // require_registered_operator tests (#1182)
 // ============================================================================
 
+// `register_operator`/`require_registered_operator` read and write instance
+// storage, which the Soroban host only allows inside a contract's execution
+// context. Tests exercising them run their storage-touching calls inside
+// `env.as_contract(&contract_id, || { .. })` against the no-op
+// `VerifierTestContract` declared above, mirroring the `verify_signature`
+// tests in this same file.
+
 #[test]
 fn test_require_registered_operator_success() {
+    use soroban_sdk::testutils::Address as _;
     let env = Env::default();
+    let contract_id = env.register_contract(None, VerifierTestContract);
     let caller = Address::generate(&env);
-    
-    // Register the operator
-    env.storage().instance().set(&symbol_short!("OPERATOR"), &true);
-    
-    let result = require_registered_operator(&env, &caller);
-    assert_eq!(result, Ok(()));
+
+    env.as_contract(&contract_id, || {
+        register_operator(&env, &caller);
+        assert_eq!(require_registered_operator(&env, &caller), Ok(()));
+    });
 }
 
 #[test]
 fn test_require_registered_operator_fails_if_missing() {
+    use soroban_sdk::testutils::Address as _;
     let env = Env::default();
+    let contract_id = env.register_contract(None, VerifierTestContract);
     let caller = Address::generate(&env);
-    
-    // Missing operator registration
-    let result = require_registered_operator(&env, &caller);
-    assert_eq!(result, Err(OperatorError::NotRegistered));
+
+    env.as_contract(&contract_id, || {
+        // No operator has ever been registered.
+        assert_eq!(
+            require_registered_operator(&env, &caller),
+            Err(OperatorError::NotRegistered)
+        );
+    });
+}
+
+/// Regression test for the bug this hardening fixes: registering *an*
+/// operator must not authorize *every* caller. Before the fix, the registry
+/// was a single shared on/off flag — `caller` was accepted but never
+/// actually consulted, so once any operator was registered every address
+/// passed this check. This must fail on `main` before the fix and pass after.
+#[test]
+fn test_require_registered_operator_rejects_unregistered_caller_id() {
+    use soroban_sdk::testutils::Address as _;
+    let env = Env::default();
+    let contract_id = env.register_contract(None, VerifierTestContract);
+    let registered = Address::generate(&env);
+    let unauthorized_contract_id = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        register_operator(&env, &registered);
+
+        // The registered operator passes.
+        assert_eq!(require_registered_operator(&env, &registered), Ok(()));
+
+        // A different, never-registered contract ID must be rejected, even
+        // though *an* operator is registered.
+        assert_eq!(
+            require_registered_operator(&env, &unauthorized_contract_id),
+            Err(OperatorError::NotRegistered)
+        );
+    });
+}
+
+#[test]
+fn test_deregister_operator_revokes_access() {
+    use soroban_sdk::testutils::Address as _;
+    let env = Env::default();
+    let contract_id = env.register_contract(None, VerifierTestContract);
+    let caller = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        register_operator(&env, &caller);
+        assert_eq!(require_registered_operator(&env, &caller), Ok(()));
+
+        deregister_operator(&env, &caller);
+        assert_eq!(
+            require_registered_operator(&env, &caller),
+            Err(OperatorError::NotRegistered)
+        );
+    });
+}
+
+#[test]
+fn test_deregister_operator_is_idempotent_for_unregistered_caller() {
+    use soroban_sdk::testutils::Address as _;
+    let env = Env::default();
+    let contract_id = env.register_contract(None, VerifierTestContract);
+    let caller = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        // Deregistering an address that was never registered must not panic.
+        deregister_operator(&env, &caller);
+        assert_eq!(
+            require_registered_operator(&env, &caller),
+            Err(OperatorError::NotRegistered)
+        );
+    });
 }
