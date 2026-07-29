@@ -208,6 +208,10 @@ pub enum BillPaymentsError {
     InvalidName = 30,
     /// Settlement occurred outside the allowed settlement window
     SettlementWindowExpired = 32,
+    /// `set_upgrade_admin` was called with `new_admin` equal to the current
+    /// upgrade admin — rejected so a mistyped no-op rotation is caught at the
+    /// call site instead of silently doing nothing.
+    SameAdmin = 33,
 }
 
 pub type Error = BillPaymentsError;
@@ -1163,6 +1167,9 @@ impl BillPayments {
     /// # Security Requirements
     /// - If no upgrade admin exists, caller must equal new_admin (bootstrap pattern)
     /// - If upgrade admin exists, only current upgrade admin can transfer
+    /// - If upgrade admin exists, `new_admin` must differ from the current upgrade
+    ///   admin — unlike the pause admin, there is no TTL grant to refresh here, so
+    ///   a same-admin call can only be a mistake (e.g. a copy-pasted address)
     /// - Caller must be authenticated via require_auth()
     ///
     /// # Parameters
@@ -1172,6 +1179,7 @@ impl BillPayments {
     /// # Returns
     /// - `Ok(())` on successful admin transfer
     /// - `Err(Error::Unauthorized)` if caller lacks permission
+    /// - `Err(Error::SameAdmin)` if `new_admin` is already the upgrade admin
     pub fn set_upgrade_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), Error> {
         remitwise_common::require_no_active_kill_switch(&env)
             .unwrap_or_else(|e| soroban_sdk::panic_with_error!(&env, e));
@@ -1181,7 +1189,8 @@ impl BillPayments {
 
         // Authorization logic:
         // 1. If no upgrade admin exists, caller must equal new_admin (bootstrap)
-        // 2. If upgrade admin exists, only current upgrade admin can transfer
+        // 2. If upgrade admin exists, only current upgrade admin can transfer,
+        //    and only to a genuinely different address
         match &current_upgrade_admin {
             None => {
                 // Bootstrap pattern - caller must be setting themselves as admin
@@ -1193,6 +1202,9 @@ impl BillPayments {
                 // Admin transfer - only current admin can transfer
                 if *current_admin != caller {
                     return Err(Error::Unauthorized);
+                }
+                if *current_admin == new_admin {
+                    return Err(Error::SameAdmin);
                 }
             }
         }
