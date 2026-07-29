@@ -2,6 +2,7 @@
 **/*.rs.bk
 *.wasm
 .env
+.envrc
 *.log
 
 # Local testing scripts

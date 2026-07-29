@@ -295,6 +295,17 @@ cargo install --locked --version 21.0.0 soroban-cli
 cargo build --release --target wasm32-unknown-unknown
 ```
 
+### Sandbox environment variables
+
+`scripts/bootstrap_deploy.sh` and `scripts/seed_local.sh` (see [Deployment](#deployment)) read their network, deployer identity, and contract IDs from environment variables with sensible defaults. If you use [direnv](https://direnv.net/), copy the example and let it auto-load per-directory:
+
+```bash
+cp .envrc.example .envrc
+direnv allow
+```
+
+`.envrc.example` documents every variable these scripts read (`NETWORK`, `SOURCE`, `SKIP_BUILD`, `OUTPUT_FILE`, `SEED_FAMILY`, and the per-contract `*_ID` vars) alongside each script's built-in default, so you only need to set what you're actually overriding. `.envrc` itself is gitignored — it's your local copy, not shared.
+
 ## Examples
 
 The workspace includes runnable examples for each contract in the `examples/` directory. These examples demonstrate basic read and write operations using the Soroban SDK test environment.
