@@ -4,12 +4,25 @@ mod testsuit {
 
     use crate::*;
     use proptest::prelude::*;
-    use remitwise_common::reversible_op::ReversibleOpError;
     use soroban_sdk::testutils::storage::Instance as _;
     use soroban_sdk::testutils::{Address as AddressTrait, Ledger, LedgerInfo};
     use soroban_sdk::{Address, Env, IntoVal, String};
     use std::format;
     use testutils::{set_ledger_time, setup_test_env};
+
+    fn set_time(env: &Env, timestamp: u64) {
+        let proto = env.ledger().protocol_version();
+        env.ledger().set(LedgerInfo {
+            protocol_version: proto,
+            sequence_number: env.ledger().sequence(),
+            timestamp,
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 0,
+            min_temp_entry_ttl: 0,
+            min_persistent_entry_ttl: 0,
+            max_entry_ttl: 6315840,
+        });
+    }
 
     proptest! {
         #[test]
@@ -213,6 +226,139 @@ mod testsuit {
         );
 
         assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Currency validation tests (SC-015)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_currency_valid_xlm() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Rent"),
+            &1000,
+            &2000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency, String::from_str(&env, "XLM"));
+    }
+
+    #[test]
+    fn test_currency_empty_defaults_to_xlm() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "EmptyCurrency"),
+            &100,
+            &2000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, ""),
+            &None,
+        );
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency, String::from_str(&env, "XLM"));
+    }
+
+    #[test]
+    fn test_currency_lowercase_normalized() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Lowercase"),
+            &200,
+            &2000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "xlm"),
+            &None,
+        );
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency, String::from_str(&env, "XLM"));
+    }
+
+    #[test]
+    fn test_currency_invalid_with_numbers() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+        let result = client.try_create_bill(
+            &owner,
+            &String::from_str(&env, "InvalidNumber"),
+            &100,
+            &2000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM1"),
+            &None,
+        );
+        assert_eq!(result, Err(Ok(Error::InvalidCurrency)));
+    }
+
+    #[test]
+    fn test_currency_invalid_too_long() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+        let result = client.try_create_bill(
+            &owner,
+            &String::from_str(&env, "TooLong"),
+            &100,
+            &2000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "VERYLONGCURRENCYCODE"),
+            &None,
+        );
+        assert_eq!(result, Err(Ok(Error::InvalidCurrency)));
+    }
+
+    #[test]
+    fn test_currency_unsupported_rejected() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+        let result = client.try_create_bill(
+            &owner,
+            &String::from_str(&env, "Unsupported"),
+            &100,
+            &2000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "NGN"),
+            &None,
+        );
+        assert_eq!(result, Err(Ok(Error::UnsupportedCurrency)));
     }
 
     #[test]
@@ -3672,6 +3818,43 @@ mod testsuit {
         assert_eq!(result, Err(Ok(Error::Unauthorized)));
     }
 
+    #[test]
+    fn test_set_upgrade_admin_rejects_same_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        // Bootstrap is unaffected: caller == new_admin is required and allowed
+        // when no upgrade admin exists yet.
+        client.set_upgrade_admin(&admin, &admin);
+
+        // A second call naming the same address as "new" is a no-op rotation —
+        // most likely a mistake — and must be rejected.
+        let result = client.try_set_upgrade_admin(&admin, &admin);
+        assert_eq!(result, Err(Ok(Error::SameAdmin)));
+
+        // The upgrade admin is unchanged.
+        assert_eq!(client.get_upgrade_admin_public(), Some(admin));
+    }
+
+    #[test]
+    fn test_set_upgrade_admin_allows_rotation_to_different_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let successor = Address::generate(&env);
+
+        client.set_upgrade_admin(&admin, &admin);
+
+        // Rotating to a genuinely different address still succeeds.
+        client.set_upgrade_admin(&admin, &successor);
+        assert_eq!(client.get_upgrade_admin_public(), Some(successor));
+    }
+
     #[derive(Debug, Clone)]
     #[allow(clippy::enum_variant_names)]
     enum Operation {
@@ -4290,5 +4473,80 @@ fn test_set_external_ref_owner_can_set() {
             bill.external_ref.unwrap(),
             String::from_str(&env, "REF-NEW")
         );
+    }
+
+    #[test]
+    fn test_admin_rotation_completes_after_the_timelock() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        let new_admin = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        set_time(&env, 1_000);
+        env.mock_all_auths();
+        client.init_admin(&admin);
+        client.propose_admin_rotation(&admin, &new_admin);
+
+        // Still before the timelock elapses.
+        set_time(&env, 1_000 + ADMIN_ROTATION_TIMELOCK_SECONDS - 1);
+        let too_early = client.try_finalize_admin_rotation();
+        assert_eq!(too_early, Err(Ok(Error::TimelockNotElapsed)));
+        assert_eq!(client.get_admin(), Some(admin.clone()));
+
+        // Timelock has now elapsed.
+        set_time(&env, 1_000 + ADMIN_ROTATION_TIMELOCK_SECONDS);
+        client.finalize_admin_rotation();
+
+        assert_eq!(client.get_admin(), Some(new_admin));
+        assert_eq!(client.get_pending_admin_rotation(), None);
+    }
+
+    #[test]
+    fn test_only_the_current_admin_can_propose_a_rotation() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        let stranger = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        let new_admin = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        client.init_admin(&admin);
+
+        let result = client.try_propose_admin_rotation(&stranger, &new_admin);
+
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_finalize_without_a_pending_rotation_fails() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        client.init_admin(&admin);
+
+        let result = client.try_finalize_admin_rotation();
+
+        assert_eq!(result, Err(Ok(Error::NoPendingRotation)));
+    }
+
+    #[test]
+    fn test_admin_cannot_be_initialized_twice() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        let other = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        client.init_admin(&admin);
+
+        let result = client.try_init_admin(&other);
+
+        assert_eq!(result, Err(Ok(Error::AdminAlreadyInitialized)));
     }
 }

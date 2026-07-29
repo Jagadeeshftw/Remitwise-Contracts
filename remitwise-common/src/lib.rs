@@ -3,6 +3,7 @@
 
 use soroban_sdk::{
     contracterror, contracttype, symbol_short, Address, Bytes, BytesN, Env, IntoVal, Map, Symbol,
+    TryFromVal, Val,
 };
 pub mod tokens;
 pub use tokens::{
@@ -590,15 +591,95 @@ pub enum OperatorError {
     NotRegistered = 99,
 }
 
-/// Helper to enforce that the caller is a registered operator.
-/// This provides central enforcement for operator-only operations.
+const STORAGE_OPERATORS: Symbol = symbol_short!("OPERATOR");
+
+fn load_operators(env: &Env) -> Map<Address, bool> {
+    env.storage()
+        .instance()
+        .get(&STORAGE_OPERATORS)
+        .unwrap_or_else(|| Map::new(env))
+}
+
+/// Registers `operator` as an authorized caller for [`require_registered_operator`].
+///
+/// Does not enforce authentication — the calling contract is responsible for
+/// gating this with its own admin check before calling it.
+pub fn register_operator(env: &Env, operator: &Address) {
+    let mut operators = load_operators(env);
+    operators.set(operator.clone(), true);
+    env.storage().instance().set(&STORAGE_OPERATORS, &operators);
+}
+
+/// Removes `operator` from the registered-operator set.
+///
+/// Does not enforce authentication — the calling contract is responsible for
+/// gating this with its own admin check before calling it.
+pub fn deregister_operator(env: &Env, operator: &Address) {
+    let mut operators = load_operators(env);
+    operators.remove(operator.clone());
+    env.storage().instance().set(&STORAGE_OPERATORS, &operators);
+}
+
+/// Helper to enforce that `caller` specifically is a registered operator.
+///
+/// This provides central enforcement for operator-only operations, rejecting
+/// external calls from any contract or account ID that hasn't been registered
+/// via [`register_operator`].
+///
+/// # Security
+/// Prior to this fix, the registry was a single shared on/off flag with no
+/// per-address tracking: once *any* operator had ever been registered, this
+/// check passed for *every* caller, regardless of identity — `caller` was
+/// accepted but never actually consulted. This now checks the specific
+/// address against the registered set.
 pub fn require_registered_operator(env: &Env, caller: &Address) -> Result<(), OperatorError> {
-    let key = symbol_short!("OPERATOR");
-    let is_registered = env.storage().instance().get(&key).unwrap_or(false);
-    if !is_registered {
+    let operators = load_operators(env);
+    if !operators.get(caller.clone()).unwrap_or(false) {
         return Err(OperatorError::NotRegistered);
     }
     Ok(())
+}
+
+/// Error for missing required environment/configuration variable.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum EnvVarError {
+    /// The requested configuration value is not set in instance storage.
+    Missing = 100,
+}
+
+/// Reads a required configuration value from the contract's instance storage.
+///
+/// This is the generic counterpart to the typed `require_*` helpers and is
+/// intended for per-contract optional configuration values that are set
+/// once at initialisation and read via the Soroban environment. If the key
+/// is absent a clear `EnvVarError::Missing` is returned instead of silently
+/// defaulting.
+///
+/// # Type Parameters
+///
+/// * `T` — The expected value type. Must implement `TryFromVal<Env, Val>` so
+///   that any Soroban-storable type (bool, u32, i128, Address, etc.) works.
+///
+/// # Arguments
+///
+/// * `env` - The Soroban environment.
+/// * `key` - The storage key to look up (typically a `Symbol` from
+///   `symbol_short!` or a `Symbol::new`).
+///
+/// # Returns
+///
+/// * `Ok(T)` if the value exists in instance storage.
+/// * `Err(EnvVarError::Missing)` if the key is absent.
+pub fn require_env_var<T>(env: &Env, key: &Symbol) -> Result<T, EnvVarError>
+where
+    T: TryFromVal<Env, Val>,
+{
+    env.storage()
+        .instance()
+        .get::<Symbol, T>(key)
+        .ok_or(EnvVarError::Missing)
 }
 
 /// Rate limit error
@@ -2074,7 +2155,6 @@ where
 pub fn same_address(a: &Address, b: &Address) -> bool {
     a == b
 }
-
 
 pub mod events;
 pub mod reversible_op;

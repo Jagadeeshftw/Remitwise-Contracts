@@ -23,6 +23,7 @@ This workspace contains the core smart contracts that power RemitWise's post-rem
 - **[docs/SIGNING_KEYS_ENV_TAGS.md](docs/SIGNING_KEYS_ENV_TAGS.md)**: How signing keys carry environment tags (network ID, domain separators, actor epoch) to prevent cross-environment replay
 - **[docs/MIGRATION_FLAGS.md](docs/MIGRATION_FLAGS.md)**: Operator runbook for migration-completion flags, replay-protection sets, and investigation-epoch write freezes
 - **[docs/OPERATOR_SIGNATURE_SCOPES.md](docs/OPERATOR_SIGNATURE_SCOPES.md)**: Operator key scopes for `verify_signature`, domain separation, and verifier registry
+- **[docs/ADMIN_ROTATION.md](docs/ADMIN_ROTATION.md)**: `reporting`'s two-step admin rotation — and why, despite the name, there is no time-delay ("timelock") in it today
 
 Shared Components
 
@@ -295,16 +296,10 @@ cargo install --locked --version 21.0.0 soroban-cli
 cargo build --release --target wasm32-unknown-unknown
 ```
 
-### Sandbox environment variables
-
-`scripts/bootstrap_deploy.sh` and `scripts/seed_local.sh` (see [Deployment](#deployment)) read their network, deployer identity, and contract IDs from environment variables with sensible defaults. If you use [direnv](https://direnv.net/), copy the example and let it auto-load per-directory:
-
-```bash
-cp .envrc.example .envrc
-direnv allow
-```
-
-`.envrc.example` documents every variable these scripts read (`NETWORK`, `SOURCE`, `SKIP_BUILD`, `OUTPUT_FILE`, `SEED_FAMILY`, and the per-contract `*_ID` vars) alongside each script's built-in default, so you only need to set what you're actually overriding. `.envrc` itself is gitignored — it's your local copy, not shared.
+If you have [`just`](https://github.com/casey/just) installed, `just help`
+(or plain `just`) lists the available recipes -- thin wrappers around the
+same cargo/make commands used above (`just check`, `just test`, `just wasm`,
+`just build`, ...). It's optional; nothing here requires it.
 
 ## Examples
 
@@ -348,6 +343,8 @@ To run an example, use `cargo run --example <example_name>`:
 - [Type-Safe Percent Conversion](docs/type-safe-percent-conversion.md) - Converting whole percentages to basis points with checked overflow arithmetic
 - [Configuration Schema Versioning](docs/CONFIG_SCHEMA_VERSIONING.md) - Protocols for bumping configuration schema versions with backward compatibility
 - [Storage Layout Reference](STORAGE_LAYOUT.md)
+- [Storage Key Naming Conventions](docs/storage-key-naming-conventions.md) - Naming rules for storage keys, plus the CI checks that enforce them
+- [Reserved Storage Keys](docs/RESERVED_STORAGE_KEYS.md) - Storage-key prefixes set aside for roadmap features; contributors must not reuse them
 - [Audit Event Fields](docs/audit-event-fields.md) - On-chain audit log fields and patterns
 - [Event Indexer](indexer/README.md) - Off-chain event indexing and querying
 - [Audit Trail](docs/AUDIT_TRAIL.md) - How to reconstruct historical state from events alone
@@ -355,6 +352,7 @@ To run an example, use `cargo run --example <example_name>`:
 - [Epoch Model](docs/EPOCH_MODEL.md) - How epoch counters bump, what they invalidate, and the stale-authorization replay threat they mitigate in the emergency killswitch and orchestrator contracts
 - [Dispute Epoch Model](docs/DISPUTE_EPOCH_MODEL.md) - Semantics + when dispute epochs bump
 - [Killswitch Trust Model](docs/killswitch-trust-model.md) - Who can trigger, who can clear, what state is preserved in the emergency killswitch
+- [Kill-Switch Recovery Runbook](docs/KILL_SWITCH_RECOVERY.md) - Operator runbook: how to engage the kill switch, verify the freeze, and safely resume operations after an incident
 - [Ledger Monotonicity](docs/LEDGER_MONOTONICITY.md) - Where and why contract code relies on ledger sequence and timestamp monotonicity
 - [Timestamp Conventions](docs/TIMESTAMP_CONVENTIONS.md) - How timestamps are represented, stored, and compared across all contracts
 - [Tagging Feature](TAGGING_FEATURE.md) - Tag-based organization system
@@ -742,6 +740,31 @@ RUST_TEST_THREADS=1 cargo test -p savings_goals --test gas_bench -- --nocapture
 RUST_TEST_THREADS=1 cargo test -p insurance --test gas_bench -- --nocapture
 RUST_TEST_THREADS=1 cargo test -p family_wallet --test gas_bench -- --nocapture
 RUST_TEST_THREADS=1 cargo test -p remittance_split --test gas_bench -- --nocapture
+```
+
+## WASM Size Delta
+
+Every `check_ci.sh` run prints a per-contract WASM size delta against a committed baseline, so a size regression is visible in the build output the moment it happens rather than at deploy time.
+
+### Quick Start
+
+Build the contracts, then print the delta table:
+
+```bash
+cargo build --release --target wasm32-unknown-unknown
+./scripts/wasm_size_delta.sh
+```
+
+This compares each contract's current `.wasm` byte size (via `scripts/collect_wasm_sizes.sh`) against `benchmarks/wasm_size_baseline.json` and prints a table with the baseline, current, absolute delta, and percentage change per contract, plus a `TOTAL` row.
+
+This is a DX surface, not a gate — unlike gas-benchmark regression checks, it always exits `0` and never fails a build on its own.
+
+### Update Baseline
+
+After a deliberate size change, refresh the baseline in the same PR:
+
+```bash
+./scripts/wasm_size_delta.sh --update
 ```
 
 ## Deployment
