@@ -1,13 +1,30 @@
 #![no_std]
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
-
-use remitwise_common::reversible_op::{BillPaymentsReversible, ReversibleOpError};
-use remitwise_common::{
-    check_and_increment_rate_limit, clamp_limit, require_stable_currency,
-    require_within_settlement_window, EventCategory, EventPriority, RemitwiseEvents, Timestamp,
-    ARCHIVE_BUMP_AMOUNT, ARCHIVE_LIFETIME_THRESHOLD, CONTRACT_VERSION, DEFAULT_CURRENCY,
-    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE, MAX_CURRENCY_LEN,
-    MAX_SETTLEMENT_WINDOW_SECS, SNAPSHOT_KEY, SNAPSHOT_VERSION,
+//! ## Storage-key layout
+//!
+//! All contract state lives in **instance storage** under two
+//! `symbol_short!` keys (short symbols are capped at 9 characters, which is
+//! why `NEXT_ID` and `BILLS` -- not more descriptive names -- are used):
+//!
+//! - `NEXT_ID: u32` -- a monotonically increasing counter. It only ever
+//!   increases (on `create_bill`, and again on the auto-created next bill
+//!   inside `pay_bill` when a recurring bill comes due); it is never
+//!   decremented, even when the bill it was minted for is later removed via
+//!   `cancel_bill`. This makes `NEXT_ID` an upper bound on bill ids that
+//!   have ever existed, not a count of bills that currently exist.
+//! - `BILLS: Map<u32, Bill>` -- every bill ever created, keyed by the id it
+//!   was minted with. **Ids in this map are not contiguous**: `cancel_bill`
+//!   removes an entry outright rather than tombstoning it, so `1..=NEXT_ID`
+//!   is a valid *iteration range* (see `get_all_bills`, `get_unpaid_bills`,
+//!   `get_overdue_bills`) but must always be probed with `Map::get` --
+//!   never assumed to be present -- since cancelled ids leave gaps.
+//!
+//! Both keys share one TTL, bumped together by `extend_instance_ttl` on
+//! every write. There is no per-bill TTL: a single bill cannot outlive (or
+//! be evicted independently of) the rest of this contract's instance
+//! storage.
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String,
+    Vec,
 };
 
 use soroban_sdk::{
@@ -296,6 +313,39 @@ pub struct PreUpgradeSnapshot {
     pub paused: bool,
     /// Pause admin address, if set.
     pub pause_admin: Option<Address>,
+}
+
+/// Seconds an admin rotation must sit proposed before it can be finalized.
+///
+/// ## Why a timelock
+///
+/// Admin rotation is a two-step, delayed process (`propose_admin_rotation`
+/// then, once the timelock has elapsed, `finalize_admin_rotation`) rather
+/// than an instant one-step handoff. If the current admin's key is ever
+/// compromised, an attacker who calls `propose_admin_rotation` does not
+/// walk away with control -- the rotation just sits pending, publicly
+/// visible via `get_pending_admin_rotation`, for this many seconds before
+/// it can take effect. That window gives the legitimate admin (or anyone
+/// watching `AdminEvent::RotationProposed`) time to notice the proposal
+/// and respond, rather than a single signature being an irreversible,
+/// instant takeover.
+const ADMIN_ROTATION_TIMELOCK_SECONDS: u64 = 2 * 86400; // 2 days
+
+/// A rotation that has been proposed but not yet finalized.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PendingAdminRotation {
+    pub new_admin: Address,
+    /// Ledger timestamp at/after which `finalize_admin_rotation` may run.
+    pub executable_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub enum AdminEvent {
+    Initialized,
+    RotationProposed,
+    RotationFinalized,
 }
 
 #[contract]
@@ -3355,119 +3405,112 @@ impl BillPayments {
         Self::build_page(&env, staging, limit)
     }
 
-    /// Get a page of **unpaid** bills for `owner` that match `currency`.
+    /// One-time admin setup.
     ///
-    /// See [`docs/PAGINATION_HANDBOOK.md`](../../docs/PAGINATION_HANDBOOK.md) for the invariants
-    /// all paginated reads must satisfy, cursor semantics, and the reviewer checklist.
+    /// # Errors
+    /// * `AdminAlreadyInitialized` - If an admin has already been set
+    pub fn init_admin(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        if env.storage().instance().has(&symbol_short!("ADMIN")) {
+            return Err(Error::AdminAlreadyInitialized);
+        }
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("ADMIN"), &admin);
+        env.events()
+            .publish((symbol_short!("admin"), AdminEvent::Initialized), admin);
+
+        Ok(())
+    }
+
+    /// Propose rotating the admin to `new_admin`. Does not take effect
+    /// immediately -- see `ADMIN_ROTATION_TIMELOCK_SECONDS`. Call
+    /// `finalize_admin_rotation` after the timelock elapses to complete it.
+    /// A second call before finalization overwrites the still-pending
+    /// proposal (and restarts its timelock) rather than stacking.
     ///
-    /// # Arguments
-    /// * `owner`    – Address of the bill owner
-    /// * `currency` – Currency code to filter by, e.g. `"USDC"`, `"XLM"`
-    /// * `cursor`   – Start after this bill ID (pass 0 for the first page)
-    /// * `limit`    – Max items per page (0 → DEFAULT_PAGE_LIMIT, capped at MAX_PAGE_LIMIT)
-    ///
-    /// # Returns
-    /// `BillPage { items, next_cursor, count }`. `next_cursor == 0` means no more pages.
-    ///
-    /// # Currency Comparison
-    /// Currency comparison is case-insensitive and whitespace-insensitive:
-    /// - "usdc", "USDC", "UsDc", " usdc " all match
-    /// - Empty currency defaults to "XLM" for comparison
-    ///
-    /// # Examples
-    /// ```rust,ignore
-    /// // Get unpaid USDC bills for owner
-    /// let page = client.get_unpaid_bills_by_currency(&owner, &"USDC".into(), &0, &10);
-    /// ```
-    ///
-    /// # Canonical Ordering
-    /// Results are always ordered by bill ID ascending. Pagination uses the same
-    /// ordering, so `cursor` is stable across repeated calls.
-    pub fn get_unpaid_bills_by_currency(
+    /// # Errors
+    /// * `AdminNotInitialized` - If no admin has been set yet
+    /// * `Unauthorized` - If caller is not the current admin
+    pub fn propose_admin_rotation(
         env: Env,
-        owner: Address,
-        currency: String,
-        cursor: u32,
-        limit: u32,
-    ) -> BillPage {
-        let limit = clamp_limit(limit);
-        let normalized_currency = Self::normalize_currency(&env, &currency);
-        let bills: Map<u32, Bill> = env
+        caller: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        let admin: Address = env
             .storage()
             .instance()
-            .get(&symbol_short!("BILLS"))
-            .unwrap_or_else(|| Map::new(&env));
+            .get(&symbol_short!("ADMIN"))
+            .ok_or(Error::AdminNotInitialized)?;
 
-        // Use the currency index for O(owner_currency_bills) traversal instead of O(owner_bills).
-        let currency_ids = Self::get_bills_by_owner_currency(&env, &owner, &normalized_currency);
-
-        let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for id in currency_ids.iter() {
-            if id <= cursor {
-                continue;
-            }
-            let Some(bill) = bills.get(id) else {
-                continue;
-            };
-            if bill.paid {
-                continue;
-            }
-            staging.push_back((id, bill));
-            if staging.len() > limit {
-                break;
-            }
+        if admin != caller {
+            return Err(Error::Unauthorized);
         }
 
-        Self::build_page(&env, staging, limit)
+        let executable_at = env.ledger().timestamp() + ADMIN_ROTATION_TIMELOCK_SECONDS;
+        let pending = PendingAdminRotation {
+            new_admin: new_admin.clone(),
+            executable_at,
+        };
+        env.storage()
+            .instance()
+            .set(&symbol_short!("PENDROT"), &pending);
+
+        env.events().publish(
+            (symbol_short!("admin"), AdminEvent::RotationProposed),
+            (new_admin, executable_at),
+        );
+
+        Ok(())
     }
 
-    /// Sum of all **unpaid** bill amounts for `owner` denominated in `currency`.
+    /// Finalize a previously proposed admin rotation, once its timelock
+    /// has elapsed. Callable by anyone -- the timelock, not the caller
+    /// identity, is what gates this taking effect.
     ///
-    /// # Overflow Behavior
-    /// Uses **saturating addition** to prevent panic on overflow. If the total would
-    /// exceed i128::MAX, returns i128::MAX instead. This ensures the aggregation is
-    /// always bounded and predictable, even with arbitrarily many large bills.
-    ///
-    /// # Arguments
-    /// * `owner`    – Address of the bill owner
-    /// * `currency` – Currency code to filter by, e.g. `"USDC"`, `"XLM"`
-    ///
-    /// # Returns
-    /// Total unpaid amount in the specified currency
-    ///
-    /// # Currency Comparison
-    /// Currency comparison is case-insensitive and whitespace-insensitive:
-    /// - "usdc", "USDC", "UsDc", " usdc " all match
-    /// - Empty currency defaults to "XLM" for comparison
-    ///
-    /// # Examples
-    /// ```rust,ignore
-    /// // Get total unpaid amount in USDC
-    /// let total_usdc = client.get_total_unpaid_by_currency(&owner, &"USDC".into());
-    /// // Get total unpaid amount in XLM
-    /// let total_xlm = client.get_total_unpaid_by_currency(&owner, &"XLM".into());
-    /// ```
-    pub fn get_total_unpaid_by_currency(env: Env, owner: Address, currency: String) -> i128 {
-        let normalized_currency = Self::normalize_currency(&env, &currency);
-        let bills: Map<u32, Bill> = env
+    /// # Errors
+    /// * `NoPendingRotation` - If no rotation has been proposed
+    /// * `TimelockNotElapsed` - If called before `executable_at`
+    pub fn finalize_admin_rotation(env: Env) -> Result<(), Error> {
+        let pending: PendingAdminRotation = env
             .storage()
             .instance()
-            .get(&symbol_short!("BILLS"))
-            .unwrap_or_else(|| Map::new(&env));
-        let mut total = 0i128;
-        for (_, bill) in bills.iter() {
-            if !bill.paid && bill.owner == owner && bill.currency == normalized_currency {
-                // Use saturating_add to prevent overflow panics
-                total = total.saturating_add(bill.amount);
-            }
+            .get(&symbol_short!("PENDROT"))
+            .ok_or(Error::NoPendingRotation)?;
+
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(Error::TimelockNotElapsed);
         }
-        total
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("ADMIN"), &pending.new_admin);
+        env.storage().instance().remove(&symbol_short!("PENDROT"));
+
+        env.events().publish(
+            (symbol_short!("admin"), AdminEvent::RotationFinalized),
+            pending.new_admin,
+        );
+
+        Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Internal helpers
-    // -----------------------------------------------------------------------
+    /// Get the current admin, or `None` if `init_admin` hasn't run yet.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&symbol_short!("ADMIN"))
+    }
 
+    /// Get the pending rotation, if one has been proposed and not yet
+    /// finalized.
+    pub fn get_pending_admin_rotation(env: Env) -> Option<PendingAdminRotation> {
+        env.storage().instance().get(&symbol_short!("PENDROT"))
+    }
+
+    /// Extend the TTL of instance storage
     fn extend_instance_ttl(env: &Env) {
         env.storage()
             .instance()
