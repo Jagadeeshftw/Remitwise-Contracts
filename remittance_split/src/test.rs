@@ -226,6 +226,150 @@ fn test_distribution_event_topic_correctness() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Balance conservation across a real `distribute_usdc` transfer
+//
+// The existing `calculate_split`/`get_split_allocations` conservation tests
+// (see `assert_conservation` below) only check the in-memory allocation
+// arithmetic — they never call `distribute_usdc` and inspect real token
+// balances afterward. Those are different guarantees: the split math being
+// correct doesn't prove the actual `token.transfer()` calls inside
+// `distribute_usdc` moved the same amounts. These tests close that gap by
+// checking `TokenClient::balance` on every account after a real transfer.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Happy path: after a successful `distribute_usdc`, the sender's balance is
+/// debited by exactly `total_amount`, each destination account holds exactly
+/// its `calculate_split` allocation, and the four destination balances sum to
+/// exactly `total_amount` — real on-chain conservation, not just the
+/// in-memory allocation arithmetic. Uses an amount that doesn't divide evenly
+/// by the split percentages, so the dust/remainder path is exercised too.
+#[test]
+fn test_distribute_usdc_conserves_balance_across_transfer() {
+    let env = Env::default();
+    // Percentages are in basis points (must sum to exactly 10_000), not
+    // percent (0-100) — see `validate_percentages`.
+    let harness = setup_split(&env, 5000, 3000, 1500, 500);
+    let client = &harness.client;
+    let owner = &harness.owner;
+    let token_addr = &harness.token_addr;
+    let stellar_client = &harness.stellar_client;
+
+    let accounts = sample_accounts(&env);
+    let total_amount = 1_001i128;
+    stellar_client.mint(owner, &total_amount);
+
+    let expected = split_expected(&env, client, total_amount);
+
+    let nonce = 1u64; // nonce 0 is consumed by initialize_split in setup_split
+    let deadline = env.ledger().timestamp() + 3600;
+    let request_hash = RemittanceSplit::compute_request_hash(
+        symbol_short!("distrib"),
+        owner.clone(),
+        nonce,
+        total_amount,
+        deadline,
+    );
+
+    client.distribute_usdc(
+        token_addr,
+        owner,
+        &nonce,
+        &deadline,
+        &request_hash,
+        &accounts,
+        &total_amount,
+    );
+
+    let token_client = soroban_sdk::token::TokenClient::new(&env, token_addr);
+
+    assert_eq!(
+        token_client.balance(owner),
+        0,
+        "sender must be debited exactly total_amount, leaving zero balance"
+    );
+    assert_eq!(
+        token_client.balance(&accounts.spending),
+        expected[0],
+        "spending must receive exactly its calculate_split allocation"
+    );
+    assert_eq!(
+        token_client.balance(&accounts.savings),
+        expected[1],
+        "savings must receive exactly its calculate_split allocation"
+    );
+    assert_eq!(
+        token_client.balance(&accounts.bills),
+        expected[2],
+        "bills must receive exactly its calculate_split allocation"
+    );
+    assert_eq!(
+        token_client.balance(&accounts.insurance),
+        expected[3],
+        "insurance must receive exactly its calculate_split allocation (incl. dust remainder)"
+    );
+
+    let total_received = token_client.balance(&accounts.spending)
+        + token_client.balance(&accounts.savings)
+        + token_client.balance(&accounts.bills)
+        + token_client.balance(&accounts.insurance);
+    assert_eq!(
+        total_received, total_amount,
+        "real on-chain balances across all four destinations must sum to exactly total_amount"
+    );
+}
+
+/// Sad path: a `distribute_usdc` call rejected before any token movement
+/// (mismatched request hash) must leave every balance untouched — the sender
+/// keeps the full minted amount and every destination account stays at zero.
+#[test]
+fn test_distribute_usdc_rejected_call_leaves_balances_unchanged() {
+    let env = Env::default();
+    // Percentages are in basis points (must sum to exactly 10_000), not
+    // percent (0-100) — see `validate_percentages`.
+    let harness = setup_split(&env, 5000, 3000, 1500, 500);
+    let client = &harness.client;
+    let owner = &harness.owner;
+    let token_addr = &harness.token_addr;
+    let stellar_client = &harness.stellar_client;
+
+    let accounts = sample_accounts(&env);
+    let total_amount = 1_000i128;
+    stellar_client.mint(owner, &total_amount);
+
+    let nonce = 1u64;
+    let deadline = env.ledger().timestamp() + 3600;
+
+    let request = DistributeUsdcRequest {
+        usdc_contract: token_addr.clone(),
+        from: owner.clone(),
+        nonce,
+        accounts: accounts.clone(),
+        total_amount,
+        deadline,
+    };
+    let wrong_hash = soroban_sdk::Bytes::from_slice(&env, &[0u8; 32]);
+
+    let result = client.try_distribute_usdc_hashed(&request, &wrong_hash);
+    assert_eq!(result, Err(Ok(RemittanceSplitError::RequestHashMismatch)));
+
+    let token_client = soroban_sdk::token::TokenClient::new(&env, token_addr);
+
+    assert_eq!(
+        token_client.balance(owner),
+        total_amount,
+        "rejected distribution must not debit the sender"
+    );
+    assert_eq!(token_client.balance(&accounts.spending), 0);
+    assert_eq!(token_client.balance(&accounts.savings), 0);
+    assert_eq!(token_client.balance(&accounts.bills), 0);
+    assert_eq!(
+        token_client.balance(&accounts.insurance),
+        0,
+        "rejected distribution must not credit any destination account"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Request Hash Tests - Test Vectors for distribute_usdc Signing
 // ──────────────────────────────────────────────────────────────────────────
 
