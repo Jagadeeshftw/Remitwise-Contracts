@@ -23,6 +23,7 @@ This workspace contains the core smart contracts that power RemitWise's post-rem
 - **[docs/SIGNING_KEYS_ENV_TAGS.md](docs/SIGNING_KEYS_ENV_TAGS.md)**: How signing keys carry environment tags (network ID, domain separators, actor epoch) to prevent cross-environment replay
 - **[docs/MIGRATION_FLAGS.md](docs/MIGRATION_FLAGS.md)**: Operator runbook for migration-completion flags, replay-protection sets, and investigation-epoch write freezes
 - **[docs/OPERATOR_SIGNATURE_SCOPES.md](docs/OPERATOR_SIGNATURE_SCOPES.md)**: Operator key scopes for `verify_signature`, domain separation, and verifier registry
+- **[docs/FEES.md](docs/FEES.md)**: How corridor fees (`fee_bps`) and the split percentages (sometimes called a "fee schedule") are computed and stored — and why they are not the same thing
 
 Shared Components
 

@@ -3,6 +3,11 @@
 A Soroban smart contract for configuring and executing percentage-based USDC distributions
 across spending, savings, bills, and insurance categories.
 
+This contract also stores per-corridor fee configuration (`Corridor.fee_bps`) — see
+[docs/FEES.md](../docs/FEES.md) for exactly how that's computed and stored, and how it
+differs from the spending/savings/bills/insurance split percentages (which the orchestrator
+calls a "fee schedule" even though no funds are removed by them).
+
 ## Security Model
 
 `distribute_usdc` is the only function that moves funds. It enforces the following invariants
