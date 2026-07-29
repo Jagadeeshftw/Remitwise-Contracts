@@ -733,6 +733,31 @@ RUST_TEST_THREADS=1 cargo test -p family_wallet --test gas_bench -- --nocapture
 RUST_TEST_THREADS=1 cargo test -p remittance_split --test gas_bench -- --nocapture
 ```
 
+## WASM Size Delta
+
+Every `check_ci.sh` run prints a per-contract WASM size delta against a committed baseline, so a size regression is visible in the build output the moment it happens rather than at deploy time.
+
+### Quick Start
+
+Build the contracts, then print the delta table:
+
+```bash
+cargo build --release --target wasm32-unknown-unknown
+./scripts/wasm_size_delta.sh
+```
+
+This compares each contract's current `.wasm` byte size (via `scripts/collect_wasm_sizes.sh`) against `benchmarks/wasm_size_baseline.json` and prints a table with the baseline, current, absolute delta, and percentage change per contract, plus a `TOTAL` row.
+
+This is a DX surface, not a gate — unlike gas-benchmark regression checks, it always exits `0` and never fails a build on its own.
+
+### Update Baseline
+
+After a deliberate size change, refresh the baseline in the same PR:
+
+```bash
+./scripts/wasm_size_delta.sh --update
+```
+
 ## Deployment
 
 ### Automated Bootstrap Deployment
