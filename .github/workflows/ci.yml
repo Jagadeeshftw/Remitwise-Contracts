@@ -61,10 +61,14 @@ jobs:
     - name: Install cargo-audit
       run: "if ! command -v cargo-audit &> /dev/null; then\n  cargo install cargo-audit --locked\nfi\n"
     - name: Run cargo audit
-      run: 'cargo audit --deny warnings
-
-        '
-      continue-on-error: true
+      # Deliberately plain `cargo audit`, not `--deny warnings`: as of this
+      # writing two transitive dependencies (bincode, paste) are flagged
+      # "unmaintained" (RUSTSEC-2025-0141, RUSTSEC-2024-0436) with no fix
+      # available — `--deny warnings` would fail every PR on an advisory
+      # nobody here can act on. Plain `cargo audit` still fails (and blocks
+      # this merge gate) on actual RUSTSEC *vulnerabilities*, which is the
+      # thing worth gating merges on.
+      run: cargo audit
   workspace-invariants:
     name: Workspace Invariants
     runs-on: ubuntu-latest
