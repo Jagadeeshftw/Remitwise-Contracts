@@ -46,8 +46,14 @@ pub struct EmergencyKillswitch;
 impl EmergencyKillswitch {
     /// Initializes the killswitch with an admin address.
     ///
+    /// Requires `admin`'s signature — without it, anyone could front-run
+    /// deployment and call `initialize` with themselves (or any address they
+    /// control) as `admin` before the intended admin does, permanently
+    /// seizing control of the kill switch.
+    ///
     /// Rejects the contract's own address as admin to prevent unrecoverable bricking.
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
