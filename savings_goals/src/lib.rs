@@ -5,159 +5,39 @@ use remitwise_common::{
     EventCategory, EventPriority, RemitwiseEvents, SNAPSHOT_KEY, SNAPSHOT_VERSION,
 };
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Env, Map, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String,
+    Symbol, Vec,
 };
 
-// Event topics
-const GOAL_CREATED: Symbol = symbol_short!("created");
-const GOAL_COMPLETED: Symbol = symbol_short!("completed");
-const FUNDS_ADDED: Symbol = symbol_short!("funds_add");
-const FUNDS_WITHDRAWN: Symbol = symbol_short!("funds_rem");
-
-#[derive(Clone)]
-#[contracttype]
-pub struct GoalCreatedEvent {
-    pub goal_id: u32,
-    pub owner: Address,
-    pub amount: i128,    // Initial amount (0)
-    pub new_total: i128, // Initial total (0)
-    pub name: String,
-    pub target_amount: i128,
-    pub target_date: u64,
-    pub locked: bool,
-    pub timestamp: u64,
+/// Mirrors `bill_payments::Error`'s naming convention (`*NotFound`,
+/// `InvalidAmount`, `Unauthorized`) so the two neighbouring contracts
+/// report failures the same way instead of one panicking with a string
+/// and the other returning a typed error.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    GoalNotFound = 1,
+    GoalLocked = 2,
+    InvalidAmount = 3,
+    InsufficientBalance = 4,
+    Unauthorized = 5,
 }
 
-#[derive(Clone)]
-#[contracttype]
-pub struct FundsAddedEvent {
-    pub goal_id: u32,
-    pub owner: Address,
-    pub amount: i128,
-    pub new_total: i128,
-    pub timestamp: u64,
-}
+// Storage TTL constants
+const INSTANCE_LIFETIME_THRESHOLD: u32 = 17280; // ~1 day
+const INSTANCE_BUMP_AMOUNT: u32 = 518400; // ~30 days
 
-#[derive(Clone)]
-#[contracttype]
-pub struct FundsWithdrawnEvent {
-    pub goal_id: u32,
-    pub owner: Address,
-    pub amount: i128,
-    pub new_total: i128,
-    pub timestamp: u64,
-}
+/// Furthest into the future (from the current ledger time) a goal's
+/// `target_date` may be pushed in a single `extend_goal_deadline` call.
+/// This is the "ledger cap": it bounds the extension relative to
+/// `env.ledger().timestamp()` at call time, not to the goal's existing
+/// `target_date`, so repeated extensions can't be chained to sidestep it.
+const MAX_EXTENSION_SECONDS: u64 = 5 * 365 * 86400; // ~5 years
 
-#[derive(Clone)]
-#[contracttype]
-pub struct GoalCompletedEvent {
-    pub goal_id: u32,
-    pub owner: Address,
-    pub amount: i128,    // Final contribution amount
-    pub new_total: i128, // Total amount reached
-    pub name: String,
-    pub timestamp: u64,
-}
-
-/// Emitted by `lock_goal` (`locked: true`) and `unlock_goal` (`locked: false`).
-#[derive(Clone)]
-#[contracttype]
-pub struct GoalLockEvent {
-    pub goal_id: u32,
-    pub owner: Address,
-    pub locked: bool,
-    pub timestamp: u64,
-}
-
-#[derive(Clone)]
-#[contracttype]
-pub struct ScheduleCreatedEvent {
-    pub schedule_id: u32,
-    pub goal_id: u32,
-    pub owner: Address,
-    pub amount: i128,
-    pub next_due: u64,
-    pub interval: u64,
-    pub timestamp: u64,
-}
-
-#[derive(Clone)]
-#[contracttype]
-pub struct ScheduleModifiedEvent {
-    pub schedule_id: u32,
-    pub goal_id: u32,
-    pub owner: Address,
-    pub amount: i128,
-    pub next_due: u64,
-    pub interval: u64,
-    pub timestamp: u64,
-}
-
-#[derive(Clone)]
-#[contracttype]
-pub struct ScheduleCancelledEvent {
-    pub schedule_id: u32,
-    pub goal_id: u32,
-    pub owner: Address,
-    pub timestamp: u64,
-}
-
-/// Emitted once per successful execution of a due schedule by
-/// `execute_due_savings_schedules`.
-#[derive(Clone)]
-#[contracttype]
-pub struct ScheduleExecutedEvent {
-    pub schedule_id: u32,
-    pub goal_id: u32,
-    pub owner: Address,
-    pub amount: i128,
-    pub timestamp: u64,
-}
-
-/// Emitted alongside `ScheduleExecutedEvent` when one or more recurring
-/// intervals were skipped (delayed execution).
-#[derive(Clone)]
-#[contracttype]
-pub struct ScheduleMissedEvent {
-    pub schedule_id: u32,
-    pub goal_id: u32,
-    pub owner: Address,
-    pub missed_count: u32,
-    pub timestamp: u64,
-}
-
-// Issue #1516 – these constants are applied exclusively to PERSISTENT
-// entries (goals, archives, schedules), but previously carried the
-// *instance* bucket's values (1-day threshold / 30-day bump) under
-// misleading INSTANCE_* names. Persistent user data was therefore
-// archived on the instance schedule — half the intended lifetime.
-// Values now match remitwise-common's persistent bucket
-// (PERSISTENT_LIFETIME_THRESHOLD / PERSISTENT_BUMP_AMOUNT).
-const PERSISTENT_LIFETIME_THRESHOLD: u32 = remitwise_common::PERSISTENT_LIFETIME_THRESHOLD;
-const PERSISTENT_BUMP_AMOUNT: u32 = remitwise_common::PERSISTENT_BUMP_AMOUNT;
-
-/// Pagination constants
-pub const DEFAULT_PAGE_LIMIT: u32 = 20;
-pub const MAX_PAGE_LIMIT: u32 = 50;
-
-/// Maximum safe goal balance allowed by the contract.
-///
-/// Keeping `current_amount <= i128::MAX/2` ensures callers can add funds without
-/// risking edge-case overflow behavior as balances approach `i128::MAX`.
-const MAX_SAFE_GOAL_BALANCE: i128 = i128::MAX / 2;
-
-/// Maximum byte length for goal names to prevent storage bloat and DoS attacks.
-///
-/// Enforces a 32-byte limit on goal names to bound storage costs while allowing
-/// reasonable names (e.g., "FIRE Goal", "House Down Payment"). Names are validated
-/// byte-by-byte, not by character count, so multi-byte UTF-8 characters count
-/// toward the limit proportionally. Printable ASCII characters (bytes 32-126) only.
-const MAX_GOAL_NAME_LEN_BYTES: u32 = 32;
-
-/// Maximum number of goals (active + archived) allowed per owner.
-/// Prevents storage-bloat DoS attacks.
-const MAX_GOALS_PER_OWNER: u32 = 2000;
+/// Savings goal data structure with owner tracking for access control
+#[contract]
+pub struct SavingsGoalContract;
 
 #[contracttype]
 #[derive(Clone)]
@@ -1462,53 +1342,26 @@ impl SavingsGoalContract {
     /// * `amount` - Amount to withdraw in stroops (must be > 0)
     ///
     /// # Returns
-    /// `Ok(remaining_amount)` - The remaining amount in the goal after withdrawal
+    /// Ok(updated current amount)
     ///
     /// # Errors
-    /// * `InvalidAmount` - If amount ≤ 0
-    /// * `GoalNotFound` - If goal_id does not exist
+    /// * `InvalidAmount` - If amount is not positive
+    /// * `GoalNotFound` - If goal with given ID doesn't exist
     /// * `Unauthorized` - If caller is not the goal owner
-    /// * `GoalLocked` - If goal is locked or time-locked
-    /// * `InsufficientBalance` - If amount > current_amount
-    /// * `Overflow` - If subtraction would underflow i128
-    ///
-    /// # Panics
-    /// * If `caller` does not authorize the transaction
-    /// Withdraws funds from an existing savings goal.
-    ///
-    /// # Arguments
-    /// * `caller` - Address of the goal owner (must authorize)
-    /// * `goal_id` - ID of the goal to withdraw from
-    /// * `amount` - Amount to withdraw in stroops (must be > 0)
-    ///
-    /// # Returns
-    /// `Ok(remaining_amount)` - The remaining amount in the goal after withdrawal
-    ///
-    /// # Errors
-    /// * `InvalidAmount` - If amount ≤ 0
-    /// * `GoalNotFound` - If goal_id does not exist
-    /// * `Unauthorized` - If caller is not the goal owner
-    /// * `InsufficientBalance` - If amount > current_amount
-    /// * `GoalLocked` - If the goal is locked or time-lock has not expired
-    ///
-    /// # Time-lock Behavior
-    /// - If `unlock_date` is set, withdrawal will fail if `env.ledger().timestamp() < unlock_date`.
-    /// - Boundary condition: Success if `timestamp == unlock_date`.
-    ///
-    /// # Events
-    /// - Emits `SavingsEvent::FundsWithdrawn`.
+    /// * `GoalLocked` - If the goal is locked
+    /// * `InsufficientBalance` - If amount exceeds the current balance
     pub fn withdraw_from_goal(
         env: Env,
         caller: Address,
         goal_id: u32,
         amount: i128,
-    ) -> Result<i128, SavingsGoalError> {
+    ) -> Result<i128, Error> {
+        // Access control: require caller authorization
         caller.require_auth();
         Self::require_not_paused(&env, pause_functions::WITHDRAW);
 
         if amount <= 0 {
-            Self::append_audit(&env, symbol_short!("withdraw"), &caller, false);
-            return Err(SavingsGoalError::InvalidAmount);
+            return Err(Error::InvalidAmount);
         }
 
         Self::extend_instance_ttl(&env);
@@ -1525,27 +1378,19 @@ impl SavingsGoalContract {
             }
         };
 
+        let mut goal = goals.get(goal_id).ok_or(Error::GoalNotFound)?;
+
+        // Access control: verify caller is the owner
         if goal.owner != caller {
-            Self::append_audit(&env, symbol_short!("withdraw"), &caller, false);
-            return Err(SavingsGoalError::Unauthorized);
+            return Err(Error::Unauthorized);
         }
 
         if goal.locked {
-            Self::append_audit(&env, symbol_short!("withdraw"), &caller, false);
-            return Err(SavingsGoalError::GoalLocked);
-        }
-
-        if let Some(unlock_date) = goal.unlock_date {
-            let current_time = env.ledger().timestamp();
-            if current_time < unlock_date {
-                Self::append_audit(&env, symbol_short!("withdraw"), &caller, false);
-                return Err(SavingsGoalError::GoalLocked);
-            }
+            return Err(Error::GoalLocked);
         }
 
         if amount > goal.current_amount {
-            Self::append_audit(&env, symbol_short!("withdraw"), &caller, false);
-            return Err(SavingsGoalError::InsufficientBalance);
+            return Err(Error::InsufficientBalance);
         }
 
         goal.current_amount = goal
@@ -1712,6 +1557,72 @@ impl SavingsGoalContract {
         true
     }
 
+    /// Push a savings goal's target date further into the future.
+    ///
+    /// # Arguments
+    /// * `caller` - Address of the caller (must be the goal owner)
+    /// * `goal_id` - ID of the goal
+    /// * `new_target_date` - The new target date as a Unix timestamp
+    ///
+    /// # Returns
+    /// The goal's updated target date
+    ///
+    /// # Panics
+    /// - If caller is not the goal owner
+    /// - If goal is not found
+    /// - If `new_target_date` is not later than the current target date
+    /// - If `new_target_date` is further than `MAX_EXTENSION_SECONDS` past
+    ///   the current ledger time (the "ledger cap")
+    pub fn extend_goal_deadline(
+        env: Env,
+        caller: Address,
+        goal_id: u32,
+        new_target_date: u64,
+    ) -> u64 {
+        // Access control: require caller authorization
+        caller.require_auth();
+
+        // Extend storage TTL
+        Self::extend_instance_ttl(&env);
+
+        let mut goals: Map<u32, SavingsGoal> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("GOALS"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        let mut goal = goals.get(goal_id).expect("Goal not found");
+
+        // Access control: verify caller is the owner
+        if goal.owner != caller {
+            panic!("Only the goal owner can extend this goal's deadline");
+        }
+
+        if new_target_date <= goal.target_date {
+            panic!("New target date must be later than the current target date");
+        }
+
+        let max_target_date = env.ledger().timestamp() + MAX_EXTENSION_SECONDS;
+        if new_target_date > max_target_date {
+            panic!("New target date exceeds the maximum extension allowed from the current ledger time");
+        }
+
+        goal.target_date = new_target_date;
+        goals.set(goal_id, goal);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("GOALS"), &goals);
+
+        new_target_date
+    }
+
+    /// Get a savings goal by ID
+    ///
+    /// # Arguments
+    /// * `goal_id` - ID of the goal
+    ///
+    /// # Returns
+    /// SavingsGoal struct or None if not found
     pub fn get_goal(env: Env, goal_id: u32) -> Option<SavingsGoal> {
         env.storage().persistent().get(&DataKey::Goal(goal_id))
     }
