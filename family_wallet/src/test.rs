@@ -55,6 +55,52 @@ fn test_initialize_wallet_succeeds() {
     assert_eq!(owner_data.unwrap().role, FamilyRole::Owner);
 }
 
+/// Exactly at the cap (owner + MAX_FAMILY_MEMBERS - 1 initial members =
+/// MAX_FAMILY_MEMBERS total) must still succeed — the cap rejects strictly
+/// more than the limit, not the limit itself.
+#[test]
+fn test_initialize_wallet_succeeds_at_member_cap_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    let mut initial_members = vec![&env];
+    for _ in 0..(MAX_FAMILY_MEMBERS - 1) {
+        initial_members.push_back(Address::generate(&env));
+    }
+
+    let result = client.init(&owner, &initial_members);
+    assert!(
+        result,
+        "initialization exactly at the member cap must succeed"
+    );
+}
+
+/// Regression test for the hardening in this PR: `initial_members` is fully
+/// caller-controlled and, before this fix, was looped over with no length
+/// check at all — an oversized list would burn CPU/memory proportional to
+/// its length instead of being rejected up front. One more than the cap
+/// (accounting for the owner, who is also added as a member) must panic
+/// immediately, not attempt the unbounded loop.
+#[test]
+#[should_panic(expected = "Initial member cap exceeded")]
+fn test_initialize_wallet_rejects_oversized_initial_members() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    let mut initial_members = vec![&env];
+    for _ in 0..MAX_FAMILY_MEMBERS {
+        initial_members.push_back(Address::generate(&env));
+    }
+
+    client.init(&owner, &initial_members);
+}
+
 #[test]
 #[should_panic(expected = "Wallet already initialized")]
 fn assert_no_double_init() {
@@ -3525,17 +3571,18 @@ fn test_too_many_signers_rejected() {
 
     let owner = Address::generate(&env);
 
-    // Create 101 members — far beyond MAX_SIGNERS (= 20; the boundary
-    // itself is pinned by test_signer_cap_boundary_* below).
-    let mut members = Vec::new(&env);
+    // 101 signers — far beyond MAX_SIGNERS (= 20; the boundary itself is
+    // pinned by test_signer_cap_boundary_* below). `configure_multisig`
+    // checks `signer_count > MAX_SIGNERS` without requiring each signer to
+    // already be a registered family member, so these don't need to be
+    // passed as `initial_members` too (which has its own, much lower,
+    // MAX_FAMILY_MEMBERS cap).
     let mut signers = Vec::new(&env);
     for _ in 0..101 {
-        let addr = Address::generate(&env);
-        members.push_back(addr.clone());
-        signers.push_back(addr);
+        signers.push_back(Address::generate(&env));
     }
 
-    client.init(&owner, &members);
+    client.init(&owner, &Vec::new(&env));
 
     let result = client.try_configure_multisig(
         &owner,

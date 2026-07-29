@@ -425,6 +425,17 @@ impl FamilyWallet {
             return false;
         }
         owner.require_auth();
+        // Reject an oversized initial member list up front, before any storage
+        // writes. `initial_members` is fully caller-controlled and, without this
+        // cap, is looped over unbounded below — an attacker (or a careless
+        // caller) could pass an arbitrarily large list and burn CPU/memory
+        // proportional to its length instead of hitting the same
+        // MAX_FAMILY_MEMBERS cap every other member-adding entrypoint
+        // (`batch_add_family_members`) already enforces. `+1` accounts for the
+        // owner, who is also added as a member below.
+        if initial_members.len().saturating_add(1) > MAX_FAMILY_MEMBERS {
+            panic!("Initial member cap exceeded");
+        }
         let existing: Option<Address> = env.storage().instance().get(&symbol_short!("OWNER"));
         if existing.is_some() {
             return false;
