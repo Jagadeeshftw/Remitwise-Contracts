@@ -202,3 +202,50 @@ jobs:
           \ > 10 ? '\u26A0\uFE0F' : memChange < -5 ? '\u2728' : '\u2705';\n      \n      comment += `- **${curr.contract}::${curr.method}**: CPU ${cpuIcon} ${cpuChange > 0 ? '+' : ''}${cpuChange}%, Memory\
           \ ${memIcon} ${memChange > 0 ? '+' : ''}${memChange}%\\n`;\n    }\n  });\n}\n\ngithub.rest.issues.createComment({\n  issue_number: context.issue.number,\n  owner: context.repo.owner,\n  repo:\
           \ context.repo.repo,\n  body: comment\n});\n"
+  msrv:
+    name: MSRV Check (Rust ${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        rust:
+        - stable
+        - '1.88.0'
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+    - name: Install Rust ${{ matrix.rust }}
+      uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+      with:
+        toolchain: ${{ matrix.rust }}
+        targets: wasm32-unknown-unknown
+    - name: Cache Cargo registry
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: cargo-registry-msrv-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          cargo-registry-msrv-${{ matrix.rust }}-
+    - name: Cache Cargo target dir
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+      with:
+        path: |
+          ~/.cargo/bin/
+          target/
+        key: cargo-target-${{ runner.os }}-msrv-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          cargo-target-${{ runner.os }}-msrv-${{ matrix.rust }}-
+    - name: Check workspace compiles natively
+      run: cargo check --workspace
+    - name: Check contract crates compile for wasm32-unknown-unknown
+      # Deliberately not --workspace: native-only tooling crates (cli,
+      # integration_tests, scenarios) pull in dependencies (e.g. mio via
+      # tokio) that don't support wasm32-unknown-unknown. The deployable
+      # contracts are exactly Cargo.toml's [workspace] default-members,
+      # which this picks up implicitly — same convention as check_ci.sh's
+      # `cargo build --release --target wasm32-unknown-unknown`.
+      run: cargo check --target wasm32-unknown-unknown
