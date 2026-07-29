@@ -13,7 +13,7 @@ This workspace contains the core smart contracts that power RemitWise's post-rem
 - **[family_wallet](family_wallet/README.md)**: Family governance, multisig approvals, and emergency transfer controls
 - **[orchestrator](orchestrator/README.md)**: Cross-contract coordination and execution of end-to-end remittance flows
 - **[reporting](reporting/README.md)**: Financial reporting and insights
-- **[emergency_killswitch](emergency_killswitch/README.md)**: Centralized emergency pause controls across contracts
+- **[emergency_killswitch](emergency_killswitch/README.md)**: Standalone emergency pause contract (global/module/function granularity) — not currently cross-called by the other contracts; see [docs/EMERGENCY_SHUTDOWN.md](docs/EMERGENCY_SHUTDOWN.md) for how this relates to each contract's own pause mechanism
 - **[remitwise-common](remitwise-common/README.md)**: Shared types and utilities used across contracts
 - **[docs/PERIOD_INVARIANTS.md](docs/PERIOD_INVARIANTS.md)**: Time-bound period invariants, ledger timestamp rules, and execution windows
 - **[docs/TIMESTAMP_CONVENTIONS.md](docs/TIMESTAMP_CONVENTIONS.md)**: Rules of the road for time — how timestamps are represented, accessed, and compared across all contracts
@@ -23,6 +23,7 @@ This workspace contains the core smart contracts that power RemitWise's post-rem
 - **[docs/SIGNING_KEYS_ENV_TAGS.md](docs/SIGNING_KEYS_ENV_TAGS.md)**: How signing keys carry environment tags (network ID, domain separators, actor epoch) to prevent cross-environment replay
 - **[docs/MIGRATION_FLAGS.md](docs/MIGRATION_FLAGS.md)**: Operator runbook for migration-completion flags, replay-protection sets, and investigation-epoch write freezes
 - **[docs/OPERATOR_SIGNATURE_SCOPES.md](docs/OPERATOR_SIGNATURE_SCOPES.md)**: Operator key scopes for `verify_signature`, domain separation, and verifier registry
+- **[docs/EMERGENCY_SHUTDOWN.md](docs/EMERGENCY_SHUTDOWN.md)**: Repo-wide operator guide to the three separate "pause"/"kill switch" mechanisms, which contracts actually support them, and which are not yet reachable
 
 Shared Components
 
